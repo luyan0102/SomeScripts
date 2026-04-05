@@ -27,13 +27,20 @@ RISK_PER_TRADE = 0.01
 LOOP_INTERVAL = 3
 MIN_LEVELS = 10
 ALERT_COOLDOWN_SECONDS = 300
+MONITOR_COOLDOWN_SECONDS = int(os.getenv("MONITOR_COOLDOWN_SECONDS", "900"))
 REQUEST_TIMEOUT = 3
 MARKET_BASE_URL = "https://fapi.binance.com"
+PRICE_BUCKET_SIZE = 100
+PRECHECK_MIN_QTY = 0.5
+PRECHECK_MIN_EVENTS = 2
 
 heatmap = {}
 liq_history = deque()
 oi_history = deque()
-last_alert = {"signal": None, "ts": 0.0}
+last_notifications = {
+    "monitor": {"ts": 0.0},
+    "signal": {"key": None, "ts": 0.0},
+}
 funding_cache = {"value": 0.0, "ts": 0.0}
 state_lock = threading.Lock()
 
@@ -139,25 +146,33 @@ def on_msg(ws, msg):
         for event in events:
             payload = event.get("o", event)
 
-            if not {"p", "S"} <= payload.keys():
+            if not {"p", "S", "s"} <= payload.keys():
+                continue
+
+            if payload["s"] != SYMBOL:
                 continue
 
             p = float(payload["p"])
             q = float(payload.get("z") or payload.get("q") or 0)
             s = payload["S"]
 
-            lvl = int(p//100)*100
+            lvl = int(p // PRICE_BUCKET_SIZE) * PRICE_BUCKET_SIZE
 
             if lvl not in heatmap:
-                heatmap[lvl]={"long":0,"short":0,"ts":now}
+                heatmap[lvl] = {
+                    "long": 0,
+                    "short": 0,
+                    "ts": now,
+                    "decay_ts": now,
+                }
 
-            if s=="SELL":
-                heatmap[lvl]["long"]+=q
+            if s == "SELL":
+                heatmap[lvl]["long"] += q
             else:
-                heatmap[lvl]["short"]+=q
+                heatmap[lvl]["short"] += q
 
-            heatmap[lvl]["ts"]=now
-            liq_history.append({"t":now,"q":q})
+            heatmap[lvl]["ts"] = now
+            liq_history.append({"t": now, "q": q})
 
         while liq_history and now-liq_history[0]["t"]>30:
             liq_history.popleft()
@@ -177,16 +192,20 @@ def ws():
 # 工具
 # =========================
 def decay():
-    now=time.time()
+    now = time.time()
     with state_lock:
         for k in list(heatmap.keys()):
-            age=now-heatmap[k]["ts"]
-            f=0.97**(age/5)
+            age = now - heatmap[k].get("decay_ts", heatmap[k]["ts"])
+            if age <= 0:
+                continue
 
-            heatmap[k]["long"]*=f
-            heatmap[k]["short"]*=f
+            f = 0.97 ** (age / 5)
 
-            if heatmap[k]["long"]+heatmap[k]["short"]<0.1:
+            heatmap[k]["long"] *= f
+            heatmap[k]["short"] *= f
+            heatmap[k]["decay_ts"] = now
+
+            if heatmap[k]["long"] + heatmap[k]["short"] < 0.1:
                 del heatmap[k]
 
 def levels():
@@ -233,23 +252,32 @@ def analyze(px, lv, fund):
 # 抢跑
 # =========================
 def pre():
-    now=time.time()
+    now = time.time()
     with state_lock:
         recent_liq = list(liq_history)
         oi_start = oi_history[0]["oi"] if oi_history else None
         oi_end = oi_history[-1]["oi"] if oi_history else None
 
-    r=sum(x["q"] for x in recent_liq if now-x["t"]<5)
-    p=sum(x["q"] for x in recent_liq if 5<now-x["t"]<10)+1e-6
+    recent_window = [x for x in recent_liq if now - x["t"] < 5]
+    previous_window = [x for x in recent_liq if 5 < now - x["t"] < 10]
+    r = sum(x["q"] for x in recent_window)
+    p = sum(x["q"] for x in previous_window)
 
-    accel=r/p
+    accel = r / p if p > 0 else 0.0
 
     if oi_start is None or oi_end is None or oi_start == oi_end:
         oi_change = 0
     else:
         oi_change = oi_end - oi_start
 
-    return accel>2 and oi_change<0, accel
+    enough_liq = (
+        len(recent_window) >= PRECHECK_MIN_EVENTS
+        and len(previous_window) >= PRECHECK_MIN_EVENTS
+        and r >= PRECHECK_MIN_QTY
+        and p >= PRECHECK_MIN_QTY
+    )
+
+    return enough_liq and accel > 2 and oi_change < 0, accel
 
 # =========================
 # 🎯 核心：交易计划生成
@@ -294,6 +322,75 @@ def build_trade_plan(px, sig, conf, lv):
         "size":size
     }
 
+
+def format_monitor_message(px, fund, o, lv, sig=None, conf=None, up=None, down=None, accel=None, pflag=None):
+    status = "数据积累中" if len(lv) < MIN_LEVELS else "正常监控"
+    signal_text = sig if sig else "WAIT"
+    conf_text = f"{conf:.3f}" if conf is not None else "-"
+    accel_text = f"{accel:.2f}" if accel is not None else "-"
+    up_text = f"{up:.2f}" if up is not None else "-"
+    down_text = f"{down:.2f}" if down is not None else "-"
+    pflag_text = str(pflag) if pflag is not None else "-"
+
+    return f"""
+📡 BTC 日常监控
+
+价格: {px:.2f}
+Funding: {fund:.6f}
+OI: {o:.2f}
+流动性层数: {len(lv)}
+监控状态: {status}
+
+方向判断: {signal_text}
+置信度: {conf_text}
+加速度: {accel_text}
+抢跑: {pflag_text}
+
+流动性:
+↑ {up_text}
+↓ {down_text}
+""".strip()
+
+
+def format_signal_message(px, fund, o, sig, conf, up, down, accel, pflag, plan):
+    return f"""
+🚨 BTC 交易信号触发
+
+价格: {px:.2f}
+Funding: {fund:.6f}
+OI: {o:.2f}
+
+信号: {sig}
+置信度: {conf:.3f}
+加速度: {accel:.2f}
+抢跑: {pflag}
+
+流动性:
+↑ {up:.2f}
+↓ {down:.2f}
+
+——————————
+🎯 交易计划
+
+入场: {plan['entry']:.2f}
+止损: {plan['sl']:.2f}
+
+止盈:
+TP1: {plan['tp1']:.2f} (减仓50%)
+TP2: {plan['tp2']:.2f} (全平)
+
+风险收益比: {plan['rr']:.2f}
+建议仓位: {plan['size']:.4f} BTC
+风险资金: {ACCOUNT_BALANCE * RISK_PER_TRADE:.2f}
+""".strip()
+
+
+def signal_key(sig, plan):
+    return (
+        f"{sig}:{plan['entry']:.2f}:{plan['sl']:.2f}:"
+        f"{plan['tp1']:.2f}:{plan['tp2']:.2f}"
+    )
+
 # =========================
 # 主循环
 # =========================
@@ -312,67 +409,58 @@ def run():
             decay()
 
             lv = levels()
-            if len(lv)<MIN_LEVELS:
-                continue
-
-            sig, conf, up, down = analyze(px, lv, fund)
+            sig = conf = up = down = None
+            plan = None
             pflag, accel = pre()
 
-            plan = build_trade_plan(px, sig, conf, lv)
+            if len(lv) >= MIN_LEVELS:
+                sig, conf, up, down = analyze(px, lv, fund)
+                plan = build_trade_plan(px, sig, conf, lv)
 
-            if not plan:
-                continue
-
-            msg = f"""
-📊 BTC 交易决策
-
-价格: {px}
-Funding: {fund:.6f}
-OI: {o}
-
-信号: {sig}
-置信度: {round(conf,3)}
-加速度: {round(accel,2)}
-
-流动性:
-↑ {round(up,2)}
-↓ {round(down,2)}
-
-——————————
-🎯 交易计划
-
-入场: {round(plan['entry'],2)}
-
-止损: {round(plan['sl'],2)}
-
-止盈:
-TP1: {round(plan['tp1'],2)} (减仓50%)
-TP2: {round(plan['tp2'],2)} (全平)
-
-风险收益比: {round(plan['rr'],2)}
-
-建议仓位:
-{round(plan['size'],4)} BTC
-风险资金: {ACCOUNT_BALANCE*RISK_PER_TRADE}
-
-——————————
-状态:
-抢跑: {pflag}
-"""
-
-            print(msg)
+            monitor_msg = format_monitor_message(
+                px=px,
+                fund=fund,
+                o=o,
+                lv=lv,
+                sig=sig,
+                conf=conf,
+                up=up,
+                down=down,
+                accel=accel,
+                pflag=pflag,
+            )
+            print(monitor_msg)
 
             now = time.time()
+            should_send_monitor = (
+                now - last_notifications["monitor"]["ts"] >= MONITOR_COOLDOWN_SECONDS
+            )
+            if should_send_monitor:
+                try:
+                    send(monitor_msg)
+                    last_notifications["monitor"]["ts"] = now
+                except Exception as e:
+                    print("monitor send error:", e)
+
+            if not plan or sig not in {"LONG", "SHORT"}:
+                continue
+
+            trade_msg = format_signal_message(px, fund, o, sig, conf, up, down, accel, pflag, plan)
+            trade_signal_key = signal_key(sig, plan)
             should_alert = (
                 pflag and (
-                    sig != last_alert["signal"] or
-                    now - last_alert["ts"] >= ALERT_COOLDOWN_SECONDS
+                    trade_signal_key != last_notifications["signal"]["key"] or
+                    now - last_notifications["signal"]["ts"] >= ALERT_COOLDOWN_SECONDS
                 )
             )
             if should_alert:
-                send("🚨 信号触发\n"+msg)
-                last_alert["signal"] = sig
-                last_alert["ts"] = now
+                print(trade_msg)
+                try:
+                    send(trade_msg)
+                    last_notifications["signal"]["key"] = trade_signal_key
+                    last_notifications["signal"]["ts"] = now
+                except Exception as e:
+                    print("signal send error:", e)
 
         except Exception as e:
             print("run error:", e)
