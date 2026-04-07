@@ -500,7 +500,11 @@ def run():
             print(monitor_msg)
 
             now = time.time()
-            if now - last_notifications["monitor"]["ts"] >= MONITOR_COOLDOWN_SECONDS:
+            should_send_monitor = (
+                sig in {"LONG", "SHORT"}
+                and now - last_notifications["monitor"]["ts"] >= MONITOR_COOLDOWN_SECONDS
+            )
+            if should_send_monitor:
                 try:
                     send(monitor_msg)
                     last_notifications["monitor"]["ts"] = now
