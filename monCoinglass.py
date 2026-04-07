@@ -1,68 +1,75 @@
 import base64
 import hashlib
 import hmac
-import json
 import os
-import threading
 import time
 import urllib.parse
-from collections import deque
 
 import requests
-import websocket
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # =========================
 # 配置
 # =========================
-SYMBOL = "BTCUSDT"
+COINGLASS_API_KEY = os.getenv("COINGLASS_API_KEY")
+COINGLASS_BASE_URL = "https://open-api-v4.coinglass.com"
+COINGLASS_COIN_SYMBOL = os.getenv("COINGLASS_COIN_SYMBOL", "BTC")
+COINGLASS_PAIR_SYMBOL = os.getenv("COINGLASS_PAIR_SYMBOL", "BTCUSDT")
+COINGLASS_EXCHANGE = os.getenv("COINGLASS_EXCHANGE", "Binance")
 
 DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK")
 DINGTALK_SECRET = os.getenv("DINGTALK_SECRET")
 ENABLE_ALERTS = os.getenv("ENABLE_ALERTS", "1") != "0"
 
-ACCOUNT_BALANCE = 10000
-RISK_PER_TRADE = 0.01
-LOOP_INTERVAL = 3
-MIN_LEVELS = 10
-ALERT_COOLDOWN_SECONDS = 300
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
+LOOP_INTERVAL = int(os.getenv("LOOP_INTERVAL", "30"))
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
 MONITOR_COOLDOWN_SECONDS = int(os.getenv("MONITOR_COOLDOWN_SECONDS", "900"))
-REQUEST_TIMEOUT = 3
-MARKET_BASE_URL = "https://fapi.binance.com"
-PRICE_BUCKET_SIZE = 100
-PRECHECK_MIN_QTY = 0.5
-PRECHECK_MIN_EVENTS = 2
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
-heatmap = {}
-liq_history = deque()
-oi_history = deque()
+MIN_LIQUIDATION_USD_1H = float(os.getenv("MIN_LIQUIDATION_USD_1H", "500000"))
+MIN_IMBALANCE_RATIO = float(os.getenv("MIN_IMBALANCE_RATIO", "0.25"))
+MIN_OI_CHANGE_PCT_15M = float(os.getenv("MIN_OI_CHANGE_PCT_15M", "0.05"))
+MIN_LIQUIDATION_ACCEL = float(os.getenv("MIN_LIQUIDATION_ACCEL", "1.2"))
+
+TRADE_SL_PCT = float(os.getenv("TRADE_SL_PCT", "0.008"))
+TRADE_TP1_PCT = float(os.getenv("TRADE_TP1_PCT", "0.010"))
+TRADE_TP2_PCT = float(os.getenv("TRADE_TP2_PCT", "0.018"))
+
+MARKET_BASE_URL = "https://fapi.binance.com"
+
 last_notifications = {
     "monitor": {"ts": 0.0},
     "signal": {"key": None, "ts": 0.0},
 }
 funding_cache = {"value": 0.0, "ts": 0.0}
-state_lock = threading.Lock()
+oi_cache = {"value": None, "ts": 0.0}
+liq_cache = {"value": None, "ts": 0.0}
 
-market_session = requests.Session()
-market_session.mount(
+http_session = requests.Session()
+http_session.mount(
     "https://",
     HTTPAdapter(
         max_retries=Retry(
             total=3,
-            backoff_factor=0.3,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET",),
+            backoff_factor=0.5,
+            status_forcelist=(408, 429, 500, 502, 503, 504),
+            allowed_methods=("GET", "POST"),
         )
     ),
 )
 
 
 def validate_config():
+    if not COINGLASS_API_KEY:
+        raise RuntimeError("未设置 COINGLASS_API_KEY 环境变量")
     if ENABLE_ALERTS and (not DINGTALK_WEBHOOK or not DINGTALK_SECRET):
         raise RuntimeError(
             "ENABLE_ALERTS=1 但未设置 DINGTALK_WEBHOOK / DINGTALK_SECRET 环境变量"
         )
+
 
 # =========================
 # 钉钉
@@ -71,306 +78,323 @@ def send(msg):
     if not ENABLE_ALERTS:
         return False
 
-    timestamp = str(round(time.time()*1000))
+    timestamp = str(round(time.time() * 1000))
     secret = DINGTALK_SECRET.encode()
-
     string = f"{timestamp}\n{DINGTALK_SECRET}"
     sign = urllib.parse.quote_plus(
         base64.b64encode(
             hmac.new(secret, string.encode(), hashlib.sha256).digest()
         )
     )
-
     url = f"{DINGTALK_WEBHOOK}&timestamp={timestamp}&sign={sign}"
 
-    resp = requests.post(
+    resp = http_session.post(
         url,
-        json={"msgtype":"text","text":{"content":msg}},
+        json={"msgtype": "text", "text": {"content": msg}},
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     return True
 
+
 # =========================
-# 数据
+# 数据源
 # =========================
-def fetch_json(path, params):
-    resp = market_session.get(
-        f"{MARKET_BASE_URL}{path}",
+def fetch_json(base_url, path, params=None, headers=None):
+    resp = http_session.get(
+        f"{base_url}{path}",
         params=params,
+        headers=headers,
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     return resp.json()
 
 
+def fetch_coinglass_json(path, params=None):
+    payload = fetch_json(
+        COINGLASS_BASE_URL,
+        path,
+        params=params,
+        headers={"CG-API-KEY": COINGLASS_API_KEY},
+    )
+
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if code not in (None, 0, "0"):
+            raise RuntimeError(
+                f"CoinGlass API error {code}: {payload.get('msg', 'unknown error')}"
+            )
+        if "data" in payload:
+            return payload["data"]
+
+    raise RuntimeError(f"CoinGlass API 返回异常: {payload!r}")
+
+
 def price():
-    return float(fetch_json(
+    data = fetch_json(
+        MARKET_BASE_URL,
         "/fapi/v1/ticker/price",
-        {"symbol":SYMBOL},
-    )["price"])
+        params={"symbol": COINGLASS_PAIR_SYMBOL},
+    )
+    return float(data["price"])
+
 
 def funding():
     now = time.time()
-    if now - funding_cache["ts"] < 60:
+    if now - funding_cache["ts"] < 300:
         return funding_cache["value"]
 
-    value = float(fetch_json(
-        "/fapi/v1/premiumIndex",
-        {"symbol":SYMBOL},
-    )["lastFundingRate"])
+    rows = fetch_coinglass_json("/api/futures/funding-rate/exchange-list")
+    target = next(
+        (row for row in rows if row.get("symbol") == COINGLASS_COIN_SYMBOL),
+        None,
+    )
+    if not target:
+        raise RuntimeError(f"未找到 {COINGLASS_COIN_SYMBOL} 的 funding 数据")
+
+    candidates = []
+    for key in ("stablecoin_margin_list", "token_margin_list"):
+        for item in target.get(key, []):
+            if "funding_rate" in item:
+                candidates.append(item)
+
+    exchange_match = next(
+        (item for item in candidates if item.get("exchange") == COINGLASS_EXCHANGE),
+        None,
+    )
+    selected = exchange_match or (candidates[0] if candidates else None)
+    if not selected:
+        raise RuntimeError(f"未找到 {COINGLASS_EXCHANGE} 的 funding 数据")
+
+    value = float(selected["funding_rate"])
     funding_cache["value"] = value
     funding_cache["ts"] = now
     return value
 
-def oi():
-    return float(fetch_json(
-        "/fapi/v1/openInterest",
-        {"symbol":SYMBOL},
-    )["openInterest"])
-# =========================
-# WS
-# =========================
-def on_msg(ws, msg):
-    data = json.loads(msg)
+
+def oi_snapshot():
     now = time.time()
+    if now - oi_cache["ts"] < 60 and oi_cache["value"] is not None:
+        return oi_cache["value"]
 
-    if isinstance(data, list):
-        events = data
-    elif isinstance(data, dict):
-        events = [data]
-    else:
-        return
+    rows = fetch_coinglass_json(
+        "/api/futures/open-interest/exchange-list",
+        {"symbol": COINGLASS_COIN_SYMBOL},
+    )
+    target = next(
+        (row for row in rows if row.get("exchange") == COINGLASS_EXCHANGE),
+        None,
+    )
+    if not target:
+        target = next((row for row in rows if row.get("exchange") == "All"), None)
+    if not target:
+        raise RuntimeError(f"未找到 {COINGLASS_COIN_SYMBOL} 的 OI 数据")
 
-    with state_lock:
-        for event in events:
-            payload = event.get("o", event)
+    value = {
+        "exchange": target.get("exchange", COINGLASS_EXCHANGE),
+        "symbol": target.get("symbol", COINGLASS_COIN_SYMBOL),
+        "open_interest_usd": float(target.get("open_interest_usd", 0.0)),
+        "open_interest_quantity": float(target.get("open_interest_quantity", 0.0)),
+        "oi_change_5m": float(target.get("open_interest_change_percent_5m", 0.0)),
+        "oi_change_15m": float(target.get("open_interest_change_percent_15m", 0.0)),
+        "oi_change_30m": float(target.get("open_interest_change_percent_30m", 0.0)),
+        "oi_change_1h": float(target.get("open_interest_change_percent_1h", 0.0)),
+        "oi_change_4h": float(target.get("open_interest_change_percent_4h", 0.0)),
+        "oi_change_24h": float(target.get("open_interest_change_percent_24h", 0.0)),
+    }
+    oi_cache["value"] = value
+    oi_cache["ts"] = now
+    return value
 
-            if not {"p", "S", "s"} <= payload.keys():
-                continue
 
-            if payload["s"] != SYMBOL:
-                continue
-
-            p = float(payload["p"])
-            q = float(payload.get("z") or payload.get("q") or 0)
-            s = payload["S"]
-
-            lvl = int(p // PRICE_BUCKET_SIZE) * PRICE_BUCKET_SIZE
-
-            if lvl not in heatmap:
-                heatmap[lvl] = {
-                    "long": 0,
-                    "short": 0,
-                    "ts": now,
-                    "decay_ts": now,
-                }
-
-            if s == "SELL":
-                heatmap[lvl]["long"] += q
-            else:
-                heatmap[lvl]["short"] += q
-
-            heatmap[lvl]["ts"] = now
-            liq_history.append({"t": now, "q": q})
-
-        while liq_history and now-liq_history[0]["t"]>30:
-            liq_history.popleft()
-
-def ws():
-    while True:
-        try:
-            websocket.WebSocketApp(
-                "wss://fstream.binance.com/ws/!forceOrder@arr",
-                on_message=on_msg
-            ).run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as e:
-            print("WS error:", e)
-            time.sleep(5)
-
-# =========================
-# 工具
-# =========================
-def decay():
+def liquidation_snapshot():
     now = time.time()
-    with state_lock:
-        for k in list(heatmap.keys()):
-            age = now - heatmap[k].get("decay_ts", heatmap[k]["ts"])
-            if age <= 0:
-                continue
+    if now - liq_cache["ts"] < 60 and liq_cache["value"] is not None:
+        return liq_cache["value"]
 
-            f = 0.97 ** (age / 5)
+    rows = fetch_coinglass_json(
+        "/api/futures/liquidation/coin-list",
+        {"exchange": COINGLASS_EXCHANGE},
+    )
+    target = next(
+        (row for row in rows if row.get("symbol") == COINGLASS_COIN_SYMBOL),
+        None,
+    )
+    if not target:
+        raise RuntimeError(f"未找到 {COINGLASS_COIN_SYMBOL} 的爆仓数据")
 
-            heatmap[k]["long"] *= f
-            heatmap[k]["short"] *= f
-            heatmap[k]["decay_ts"] = now
+    value = {
+        "total_24h": float(target.get("liquidation_usd_24h", 0.0)),
+        "long_24h": float(target.get("long_liquidation_usd_24h", 0.0)),
+        "short_24h": float(target.get("short_liquidation_usd_24h", 0.0)),
+        "total_12h": float(target.get("liquidation_usd_12h", 0.0)),
+        "long_12h": float(target.get("long_liquidation_usd_12h", 0.0)),
+        "short_12h": float(target.get("short_liquidation_usd_12h", 0.0)),
+        "total_4h": float(target.get("liquidation_usd_4h", 0.0)),
+        "long_4h": float(target.get("long_liquidation_usd_4h", 0.0)),
+        "short_4h": float(target.get("short_liquidation_usd_4h", 0.0)),
+        "total_1h": float(target.get("liquidation_usd_1h", 0.0)),
+        "long_1h": float(target.get("long_liquidation_usd_1h", 0.0)),
+        "short_1h": float(target.get("short_liquidation_usd_1h", 0.0)),
+    }
+    liq_cache["value"] = value
+    liq_cache["ts"] = now
+    return value
 
-            if heatmap[k]["long"] + heatmap[k]["short"] < 0.1:
-                del heatmap[k]
-
-def levels():
-    with state_lock:
-        return [{"price":p,"size":d["long"]+d["short"]} for p,d in heatmap.items()]
-
-def update_oi(v):
-    now=time.time()
-    with state_lock:
-        oi_history.append({"t":now,"oi":v})
-
-        while oi_history and now-oi_history[0]["t"]>60:
-            oi_history.popleft()
 
 # =========================
 # 信号分析
 # =========================
-def analyze(px, lv, fund):
-    up, down = 0,0
+def clamp(value, low, high):
+    return max(low, min(value, high))
 
-    for l in lv:
-        w = l["size"]/(abs(l["price"]-px)+50)
 
-        if l["price"]>px:
-            up+=w
-        else:
-            down+=w
+def analyze(fund, oi_data, liq_data):
+    total_1h = liq_data["total_1h"]
+    total_4h = liq_data["total_4h"]
+    total_24h = liq_data["total_24h"]
 
-    if fund>0: down*=1.2
-    else: up*=1.2
+    bias_1h = (liq_data["short_1h"] - liq_data["long_1h"]) / (total_1h + 1e-6)
+    bias_4h = (liq_data["short_4h"] - liq_data["long_4h"]) / (total_4h + 1e-6)
+    combined_bias = 0.7 * bias_1h + 0.3 * bias_4h
 
-    if down>up*1.2:
-        sig="SHORT"
-    elif up>down*1.2:
-        sig="LONG"
-    else:
-        sig="WAIT"
+    hourly_avg_24h = total_24h / 24 if total_24h > 0 else 0.0
+    liq_accel = total_1h / hourly_avg_24h if hourly_avg_24h > 0 else 0.0
+    oi_change_15m = oi_data["oi_change_15m"]
+    oi_change_1h = oi_data["oi_change_1h"]
 
-    conf = abs(up-down)/(up+down+1e-6)
-
-    return sig,conf,up,down
-
-# =========================
-# 抢跑
-# =========================
-def pre():
-    now = time.time()
-    with state_lock:
-        recent_liq = list(liq_history)
-        oi_start = oi_history[0]["oi"] if oi_history else None
-        oi_end = oi_history[-1]["oi"] if oi_history else None
-
-    recent_window = [x for x in recent_liq if now - x["t"] < 5]
-    previous_window = [x for x in recent_liq if 5 < now - x["t"] < 10]
-    r = sum(x["q"] for x in recent_window)
-    p = sum(x["q"] for x in previous_window)
-
-    accel = r / p if p > 0 else 0.0
-
-    if oi_start is None or oi_end is None or oi_start == oi_end:
-        oi_change = 0
-    else:
-        oi_change = oi_end - oi_start
-
-    enough_liq = (
-        len(recent_window) >= PRECHECK_MIN_EVENTS
-        and len(previous_window) >= PRECHECK_MIN_EVENTS
-        and r >= PRECHECK_MIN_QTY
-        and p >= PRECHECK_MIN_QTY
+    has_event = (
+        total_1h >= MIN_LIQUIDATION_USD_1H
+        and abs(combined_bias) >= MIN_IMBALANCE_RATIO
+        and liq_accel >= MIN_LIQUIDATION_ACCEL
     )
 
-    return enough_liq and accel > 2 and oi_change < 0, accel
+    if has_event and combined_bias > 0 and oi_change_15m >= MIN_OI_CHANGE_PCT_15M:
+        signal = "LONG"
+    elif has_event and combined_bias < 0 and oi_change_15m >= MIN_OI_CHANGE_PCT_15M:
+        signal = "SHORT"
+    else:
+        signal = "WAIT"
+
+    confidence = (
+        0.55 * clamp(abs(combined_bias), 0.0, 1.0)
+        + 0.25 * clamp(liq_accel / max(MIN_LIQUIDATION_ACCEL, 1e-6) - 1, 0.0, 1.0)
+        + 0.20 * clamp(oi_change_15m / max(MIN_OI_CHANGE_PCT_15M, 1e-6) - 1, 0.0, 1.0)
+    )
+
+    if signal == "LONG" and fund < 0:
+        confidence += 0.05
+    if signal == "SHORT" and fund > 0:
+        confidence += 0.05
+    confidence = clamp(confidence, 0.0, 0.99)
+
+    metrics = {
+        "bias_1h": bias_1h,
+        "bias_4h": bias_4h,
+        "combined_bias": combined_bias,
+        "liq_accel": liq_accel,
+        "hourly_avg_24h": hourly_avg_24h,
+        "oi_change_15m": oi_change_15m,
+        "oi_change_1h": oi_change_1h,
+        "event_flag": has_event,
+    }
+    return signal, confidence, metrics
+
 
 # =========================
-# 🎯 核心：交易计划生成
+# 交易计划
 # =========================
-def build_trade_plan(px, sig, conf, lv):
+def build_trade_plan(px, signal, confidence):
+    sl_pct = TRADE_SL_PCT
+    tp1_pct = TRADE_TP1_PCT
+    tp2_pct = TRADE_TP2_PCT
 
-    # 找最近流动性
-    above = sorted([l for l in lv if l["price"]>px], key=lambda x:x["price"])
-    below = sorted([l for l in lv if l["price"]<px], key=lambda x:x["price"], reverse=True)
-
-    if not above or not below:
-        return None
-
-    if sig=="LONG":
-        tp1 = above[0]["price"]
-        tp2 = above[min(1,len(above)-1)]["price"]
-        sl = below[0]["price"]
-
-    elif sig=="SHORT":
-        tp1 = below[0]["price"]
-        tp2 = below[min(1,len(below)-1)]["price"]
-        sl = above[0]["price"]
-
+    if signal == "LONG":
+        sl = px * (1 - sl_pct)
+        tp1 = px * (1 + tp1_pct)
+        tp2 = px * (1 + tp2_pct)
+    elif signal == "SHORT":
+        sl = px * (1 + sl_pct)
+        tp1 = px * (1 - tp1_pct)
+        tp2 = px * (1 - tp2_pct)
     else:
         return None
 
-    # 风险收益
-    risk = abs(px-sl)
-    reward = 0.5 * abs(tp1 - px) + 0.5 * abs(tp2 - px)
-    rr = reward/(risk+1e-6)
+    risk = abs(px - sl)
+    if risk < 1e-6:
+        return None
 
-    # 仓位
-    risk_amt = ACCOUNT_BALANCE*RISK_PER_TRADE
-    size = (risk_amt/risk)*(0.5+conf)
+    reward = 0.5 * abs(tp1 - px) + 0.5 * abs(tp2 - px)
+    rr = reward / risk
+    risk_amt = ACCOUNT_BALANCE * RISK_PER_TRADE
+    size = (risk_amt / risk) * (0.5 + confidence)
 
     return {
-        "entry":px,
-        "tp1":tp1,
-        "tp2":tp2,
-        "sl":sl,
-        "rr":rr,
-        "size":size
+        "entry": px,
+        "tp1": tp1,
+        "tp2": tp2,
+        "sl": sl,
+        "rr": rr,
+        "size": size,
     }
 
 
-def format_monitor_message(px, fund, o, lv, sig=None, conf=None, up=None, down=None, accel=None, pflag=None):
-    status = "数据积累中" if len(lv) < MIN_LEVELS else "正常监控"
-    signal_text = sig if sig else "WAIT"
-    conf_text = f"{conf:.3f}" if conf is not None else "-"
-    accel_text = f"{accel:.2f}" if accel is not None else "-"
-    up_text = f"{up:.2f}" if up is not None else "-"
-    down_text = f"{down:.2f}" if down is not None else "-"
-    pflag_text = str(pflag) if pflag is not None else "-"
+def format_monitor_message(px, fund, oi_data, liq_data, sig, conf, metrics):
+    status = "事件不足" if not metrics["event_flag"] else "可触发监控"
 
     return f"""
 📡 BTC 日常监控
 
+数据源: CoinGlass Non-Heatmap
+交易所: {COINGLASS_EXCHANGE}
+交易对: {COINGLASS_PAIR_SYMBOL}
+
 价格: {px:.2f}
 Funding: {fund:.6f}
-OI: {o:.2f}
-流动性层数: {len(lv)}
+OI: {oi_data['open_interest_quantity']:.2f}
+OI(USD): {oi_data['open_interest_usd']:,.2f}
+OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}%
+
+1h爆仓: {liq_data['total_1h']:,.2f} USD
+1h多头爆仓: {liq_data['long_1h']:,.2f}
+1h空头爆仓: {liq_data['short_1h']:,.2f}
+4h爆仓: {liq_data['total_4h']:,.2f} USD
+24h小时均值: {metrics['hourly_avg_24h']:,.2f} USD
+
 监控状态: {status}
-
-方向判断: {signal_text}
-置信度: {conf_text}
-加速度: {accel_text}
-抢跑: {pflag_text}
-
-流动性:
-↑ {up_text}
-↓ {down_text}
+方向判断: {sig}
+置信度: {conf:.3f}
+失衡度(1h/4h): {metrics['bias_1h']:.3f} / {metrics['bias_4h']:.3f}
+综合偏向: {metrics['combined_bias']:.3f}
+爆仓加速度: {metrics['liq_accel']:.2f}
 """.strip()
 
 
-def format_signal_message(px, fund, o, sig, conf, up, down, accel, pflag, plan):
+def format_signal_message(px, fund, oi_data, liq_data, sig, conf, metrics, plan):
     return f"""
 🚨 BTC 交易信号触发
 
+数据源: CoinGlass Non-Heatmap
+交易所: {COINGLASS_EXCHANGE}
+交易对: {COINGLASS_PAIR_SYMBOL}
+
 价格: {px:.2f}
 Funding: {fund:.6f}
-OI: {o:.2f}
+OI: {oi_data['open_interest_quantity']:.2f}
+OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}%
+
+1h爆仓: {liq_data['total_1h']:,.2f} USD
+1h多头爆仓: {liq_data['long_1h']:,.2f}
+1h空头爆仓: {liq_data['short_1h']:,.2f}
+综合偏向: {metrics['combined_bias']:.3f}
+爆仓加速度: {metrics['liq_accel']:.2f}
 
 信号: {sig}
 置信度: {conf:.3f}
-加速度: {accel:.2f}
-抢跑: {pflag}
-
-流动性:
-↑ {up:.2f}
-↓ {down:.2f}
 
 ——————————
-🎯 交易计划
+🎯 固定百分比交易计划
 
 入场: {plan['entry']:.2f}
 止损: {plan['sl']:.2f}
@@ -385,57 +409,42 @@ TP2: {plan['tp2']:.2f} (全平)
 """.strip()
 
 
-def signal_key(sig, plan):
+def signal_key(sig, plan, metrics):
     return (
         f"{sig}:{plan['entry']:.2f}:{plan['sl']:.2f}:"
-        f"{plan['tp1']:.2f}:{plan['tp2']:.2f}"
+        f"{plan['tp1']:.2f}:{plan['tp2']:.2f}:{metrics['combined_bias']:.3f}"
     )
+
 
 # =========================
 # 主循环
 # =========================
 def run():
-    threading.Thread(target=ws, daemon=True).start()
-
-    print("🚀 决策系统启动")
+    print("🚀 CoinGlass non-heatmap 监控启动")
 
     while True:
         try:
             px = price()
             fund = funding()
-            o = oi()
+            oi_data = oi_snapshot()
+            liq_data = liquidation_snapshot()
 
-            update_oi(o)
-            decay()
-
-            lv = levels()
-            sig = conf = up = down = None
-            plan = None
-            pflag, accel = pre()
-
-            if len(lv) >= MIN_LEVELS:
-                sig, conf, up, down = analyze(px, lv, fund)
-                plan = build_trade_plan(px, sig, conf, lv)
+            sig, conf, metrics = analyze(fund, oi_data, liq_data)
+            plan = build_trade_plan(px, sig, conf) if sig in {"LONG", "SHORT"} else None
 
             monitor_msg = format_monitor_message(
                 px=px,
                 fund=fund,
-                o=o,
-                lv=lv,
+                oi_data=oi_data,
+                liq_data=liq_data,
                 sig=sig,
                 conf=conf,
-                up=up,
-                down=down,
-                accel=accel,
-                pflag=pflag,
+                metrics=metrics,
             )
             print(monitor_msg)
 
             now = time.time()
-            should_send_monitor = (
-                now - last_notifications["monitor"]["ts"] >= MONITOR_COOLDOWN_SECONDS
-            )
-            if should_send_monitor:
+            if now - last_notifications["monitor"]["ts"] >= MONITOR_COOLDOWN_SECONDS:
                 try:
                     send(monitor_msg)
                     last_notifications["monitor"]["ts"] = now
@@ -443,14 +452,25 @@ def run():
                     print("monitor send error:", e)
 
             if not plan or sig not in {"LONG", "SHORT"}:
+                time.sleep(LOOP_INTERVAL)
                 continue
 
-            trade_msg = format_signal_message(px, fund, o, sig, conf, up, down, accel, pflag, plan)
-            trade_signal_key = signal_key(sig, plan)
+            trade_msg = format_signal_message(
+                px=px,
+                fund=fund,
+                oi_data=oi_data,
+                liq_data=liq_data,
+                sig=sig,
+                conf=conf,
+                metrics=metrics,
+                plan=plan,
+            )
+            trade_signal_key = signal_key(sig, plan, metrics)
             should_alert = (
-                pflag and (
-                    trade_signal_key != last_notifications["signal"]["key"] or
-                    now - last_notifications["signal"]["ts"] >= ALERT_COOLDOWN_SECONDS
+                metrics["event_flag"]
+                and (
+                    trade_signal_key != last_notifications["signal"]["key"]
+                    or now - last_notifications["signal"]["ts"] >= ALERT_COOLDOWN_SECONDS
                 )
             )
             if should_alert:
@@ -465,8 +485,7 @@ def run():
         except Exception as e:
             print("run error:", e)
 
-        finally:
-            time.sleep(LOOP_INTERVAL)
+        time.sleep(LOOP_INTERVAL)
 
 
 if __name__ == "__main__":
