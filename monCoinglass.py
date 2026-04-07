@@ -32,6 +32,9 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 MIN_LIQUIDATION_USD_1H = float(os.getenv("MIN_LIQUIDATION_USD_1H", "500000"))
 MIN_IMBALANCE_RATIO = float(os.getenv("MIN_IMBALANCE_RATIO", "0.25"))
 MIN_OI_CHANGE_PCT_15M = float(os.getenv("MIN_OI_CHANGE_PCT_15M", "0.05"))
+MIN_OI_REVERSAL_DROP_PCT_15M = float(
+    os.getenv("MIN_OI_REVERSAL_DROP_PCT_15M", "0.05")
+)
 MIN_LIQUIDATION_ACCEL = float(os.getenv("MIN_LIQUIDATION_ACCEL", "1.2"))
 
 TRADE_SL_PCT = float(os.getenv("TRADE_SL_PCT", "0.008"))
@@ -250,6 +253,15 @@ def clamp(value, low, high):
     return max(low, min(value, high))
 
 
+def signal_mode_label(signal_mode):
+    labels = {
+        "MOMENTUM": "顺势",
+        "REVERSAL": "反转",
+        "-": "-",
+    }
+    return labels.get(signal_mode, signal_mode)
+
+
 def analyze(fund, oi_data, liq_data):
     total_1h = liq_data["total_1h"]
     total_4h = liq_data["total_4h"]
@@ -270,17 +282,51 @@ def analyze(fund, oi_data, liq_data):
         and liq_accel >= MIN_LIQUIDATION_ACCEL
     )
 
-    if has_event and combined_bias > 0 and oi_change_15m >= MIN_OI_CHANGE_PCT_15M:
+    oi_is_expanding = oi_change_15m >= MIN_OI_CHANGE_PCT_15M
+    oi_is_shrinking = oi_change_15m <= -MIN_OI_REVERSAL_DROP_PCT_15M
+
+    if has_event and combined_bias > 0 and oi_is_expanding:
         signal = "LONG"
-    elif has_event and combined_bias < 0 and oi_change_15m >= MIN_OI_CHANGE_PCT_15M:
+        signal_mode = "MOMENTUM"
+    elif has_event and combined_bias < 0 and oi_is_expanding:
         signal = "SHORT"
+        signal_mode = "MOMENTUM"
+    elif has_event and combined_bias > 0 and oi_is_shrinking:
+        signal = "SHORT"
+        signal_mode = "REVERSAL"
+    elif has_event and combined_bias < 0 and oi_is_shrinking:
+        signal = "LONG"
+        signal_mode = "REVERSAL"
     else:
         signal = "WAIT"
+        signal_mode = "-"
+
+    if oi_is_expanding:
+        oi_regime = "EXPAND"
+    elif oi_is_shrinking:
+        oi_regime = "SHRINK"
+    else:
+        oi_regime = "FLAT"
+
+    if signal_mode == "MOMENTUM":
+        oi_factor = clamp(
+            oi_change_15m / max(MIN_OI_CHANGE_PCT_15M, 1e-6) - 1,
+            0.0,
+            1.0,
+        )
+    elif signal_mode == "REVERSAL":
+        oi_factor = clamp(
+            abs(oi_change_15m) / max(MIN_OI_REVERSAL_DROP_PCT_15M, 1e-6) - 1,
+            0.0,
+            1.0,
+        )
+    else:
+        oi_factor = 0.0
 
     confidence = (
         0.55 * clamp(abs(combined_bias), 0.0, 1.0)
         + 0.25 * clamp(liq_accel / max(MIN_LIQUIDATION_ACCEL, 1e-6) - 1, 0.0, 1.0)
-        + 0.20 * clamp(oi_change_15m / max(MIN_OI_CHANGE_PCT_15M, 1e-6) - 1, 0.0, 1.0)
+        + 0.20 * oi_factor
     )
 
     if signal == "LONG" and fund < 0:
@@ -298,8 +344,10 @@ def analyze(fund, oi_data, liq_data):
         "oi_change_15m": oi_change_15m,
         "oi_change_1h": oi_change_1h,
         "event_flag": has_event,
+        "oi_regime": oi_regime,
+        "signal_mode": signal_mode,
     }
-    return signal, confidence, metrics
+    return signal, signal_mode, confidence, metrics
 
 
 # =========================
@@ -341,7 +389,12 @@ def build_trade_plan(px, signal, confidence):
 
 
 def format_monitor_message(px, fund, oi_data, liq_data, sig, conf, metrics):
-    status = "事件不足" if not metrics["event_flag"] else "可触发监控"
+    if not metrics["event_flag"]:
+        status = "事件不足"
+    elif sig == "WAIT":
+        status = "事件形成但 OI 未确认"
+    else:
+        status = "信号成立"
 
     return f"""
 📡 BTC 日常监控
@@ -363,8 +416,10 @@ OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}
 24h小时均值: {metrics['hourly_avg_24h']:,.2f} USD
 
 监控状态: {status}
+信号模式: {signal_mode_label(metrics['signal_mode'])}
 方向判断: {sig}
 置信度: {conf:.3f}
+OI状态: {metrics['oi_regime']}
 失衡度(1h/4h): {metrics['bias_1h']:.3f} / {metrics['bias_4h']:.3f}
 综合偏向: {metrics['combined_bias']:.3f}
 爆仓加速度: {metrics['liq_accel']:.2f}
@@ -391,6 +446,7 @@ OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}
 爆仓加速度: {metrics['liq_accel']:.2f}
 
 信号: {sig}
+模式: {signal_mode_label(metrics['signal_mode'])}
 置信度: {conf:.3f}
 
 ——————————
@@ -411,7 +467,7 @@ TP2: {plan['tp2']:.2f} (全平)
 
 def signal_key(sig, plan, metrics):
     return (
-        f"{sig}:{plan['entry']:.2f}:{plan['sl']:.2f}:"
+        f"{sig}:{metrics['signal_mode']}:{plan['entry']:.2f}:{plan['sl']:.2f}:"
         f"{plan['tp1']:.2f}:{plan['tp2']:.2f}:{metrics['combined_bias']:.3f}"
     )
 
@@ -429,7 +485,7 @@ def run():
             oi_data = oi_snapshot()
             liq_data = liquidation_snapshot()
 
-            sig, conf, metrics = analyze(fund, oi_data, liq_data)
+            sig, signal_mode, conf, metrics = analyze(fund, oi_data, liq_data)
             plan = build_trade_plan(px, sig, conf) if sig in {"LONG", "SHORT"} else None
 
             monitor_msg = format_monitor_message(
