@@ -471,6 +471,9 @@ OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}
 1h爆仓: {liq_data['total_1h']:,.2f} USD
 1h多头爆仓: {liq_data['long_1h']:,.2f}
 1h空头爆仓: {liq_data['short_1h']:,.2f}
+4h爆仓: {liq_data['total_4h']:,.2f} USD
+24h小时均值: {metrics['hourly_avg_24h']:,.2f} USD
+失衡度(1h/4h): {metrics['bias_1h']:.3f} / {metrics['bias_4h']:.3f}
 综合偏向: {metrics['combined_bias']:.3f}
 爆仓加速度: {metrics['liq_accel']:.2f}
 
@@ -479,20 +482,6 @@ OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}
 标签: {signal_tier_label(metrics['signal_mode'], conf)}
 置信度: {conf:.3f}
 解读: {signal_commentary(sig, metrics)}
-
-——————————
-🎯 固定百分比交易计划
-
-入场: {plan['entry']:.2f}
-止损: {plan['sl']:.2f}
-
-止盈:
-TP1: {plan['tp1']:.2f} (减仓50%)
-TP2: {plan['tp2']:.2f} (全平)
-
-风险收益比: {plan['rr']:.2f}
-建议仓位: {plan['size']:.4f} BTC
-风险资金: {ACCOUNT_BALANCE * RISK_PER_TRADE:.2f}
 """.strip()
 
 
