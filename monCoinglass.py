@@ -262,6 +262,33 @@ def signal_mode_label(signal_mode):
     return labels.get(signal_mode, signal_mode)
 
 
+def signal_tier_label(signal_mode, confidence):
+    if signal_mode == "REVERSAL":
+        if confidence >= 0.75:
+            return "强反转"
+        return "弱反转"
+    if signal_mode == "MOMENTUM":
+        if confidence >= 0.75:
+            return "强顺势"
+        return "顺势延续"
+    return "-"
+
+
+def signal_commentary(signal, metrics):
+    signal_mode = metrics["signal_mode"]
+    if signal == "LONG" and signal_mode == "MOMENTUM":
+        return "空头爆仓主导且 OI 扩张，倾向上破延续。"
+    if signal == "SHORT" and signal_mode == "MOMENTUM":
+        return "多头爆仓主导且 OI 扩张，倾向下破延续。"
+    if signal == "LONG" and signal_mode == "REVERSAL":
+        return "多头踩踏后 OI 收缩，倾向超跌反弹。"
+    if signal == "SHORT" and signal_mode == "REVERSAL":
+        return "空头挤压后 OI 收缩，倾向冲高回落。"
+    if metrics["event_flag"]:
+        return "爆仓事件已形成，但 OI 尚未完成方向确认。"
+    return "爆仓强度不足，维持观察。"
+
+
 def analyze(fund, oi_data, liq_data):
     total_1h = liq_data["total_1h"]
     total_4h = liq_data["total_4h"]
@@ -417,12 +444,14 @@ OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}
 
 监控状态: {status}
 信号模式: {signal_mode_label(metrics['signal_mode'])}
+信号标签: {signal_tier_label(metrics['signal_mode'], conf)}
 方向判断: {sig}
 置信度: {conf:.3f}
 OI状态: {metrics['oi_regime']}
 失衡度(1h/4h): {metrics['bias_1h']:.3f} / {metrics['bias_4h']:.3f}
 综合偏向: {metrics['combined_bias']:.3f}
 爆仓加速度: {metrics['liq_accel']:.2f}
+信号解读: {signal_commentary(sig, metrics)}
 """.strip()
 
 
@@ -447,7 +476,9 @@ OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}
 
 信号: {sig}
 模式: {signal_mode_label(metrics['signal_mode'])}
+标签: {signal_tier_label(metrics['signal_mode'], conf)}
 置信度: {conf:.3f}
+解读: {signal_commentary(sig, metrics)}
 
 ——————————
 🎯 固定百分比交易计划
@@ -500,16 +531,6 @@ def run():
             print(monitor_msg)
 
             now = time.time()
-            should_send_monitor = (
-                sig in {"LONG", "SHORT"}
-                and now - last_notifications["monitor"]["ts"] >= MONITOR_COOLDOWN_SECONDS
-            )
-            if should_send_monitor:
-                try:
-                    send(monitor_msg)
-                    last_notifications["monitor"]["ts"] = now
-                except Exception as e:
-                    print("monitor send error:", e)
 
             if not plan or sig not in {"LONG", "SHORT"}:
                 time.sleep(LOOP_INTERVAL)
