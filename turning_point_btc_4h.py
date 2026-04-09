@@ -27,12 +27,12 @@ def parse_args():
     )
     parser.add_argument(
         "--webhook",
-        default=os.getenv("DINGTALK_WEBHOOK", "").strip(),
+        default=os.getenv("DINGTALK_WEBHOOK2", "").strip(),
         help="钉钉 webhook，默认读取 DINGTALK_WEBHOOK",
     )
     parser.add_argument(
         "--secret",
-        default=os.getenv("DINGTALK_SECRET", "").strip(),
+        default=os.getenv("DINGTALK_SECRET2", "").strip(),
         help="钉钉签名 secret，默认读取 DINGTALK_SECRET",
     )
     parser.add_argument(
