@@ -9,6 +9,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from env_loader import load_local_env
+
+
+load_local_env()
+
 # =========================
 # 配置
 # =========================
@@ -18,8 +23,8 @@ COINGLASS_COIN_SYMBOL = os.getenv("COINGLASS_COIN_SYMBOL", "BTC")
 COINGLASS_PAIR_SYMBOL = os.getenv("COINGLASS_PAIR_SYMBOL", "BTCUSDT")
 COINGLASS_EXCHANGE = os.getenv("COINGLASS_EXCHANGE", "Binance")
 
-DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK")
-DINGTALK_SECRET = os.getenv("DINGTALK_SECRET")
+DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK2") or os.getenv("DINGTALK_WEBHOOK")
+DINGTALK_SECRET = os.getenv("DINGTALK_SECRET2") or os.getenv("DINGTALK_SECRET")
 ENABLE_ALERTS = os.getenv("ENABLE_ALERTS", "1") != "0"
 
 ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000"))
@@ -70,7 +75,7 @@ def validate_config():
         raise RuntimeError("未设置 COINGLASS_API_KEY 环境变量")
     if ENABLE_ALERTS and (not DINGTALK_WEBHOOK or not DINGTALK_SECRET):
         raise RuntimeError(
-            "ENABLE_ALERTS=1 但未设置 DINGTALK_WEBHOOK / DINGTALK_SECRET 环境变量"
+            "ENABLE_ALERTS=1 但未设置 DINGTALK_WEBHOOK2 / DINGTALK_SECRET2 环境变量"
         )
 
 

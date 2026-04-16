@@ -12,6 +12,11 @@ import numpy as np
 import pandas as pd
 import requests
 
+from env_loader import load_local_env
+
+
+load_local_env()
+
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 MAX_LIMIT = 1000
@@ -785,4 +790,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

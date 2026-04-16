@@ -2,8 +2,11 @@ import argparse
 import os
 from types import SimpleNamespace
 
+from env_loader import load_local_env
 import turning_point_btc as base
 
+
+load_local_env()
 
 DEFAULT_HORIZONS = [1, 6, 18]
 
@@ -27,13 +30,13 @@ def parse_args():
     )
     parser.add_argument(
         "--webhook",
-        default=os.getenv("DINGTALK_WEBHOOK2", "").strip(),
-        help="钉钉 webhook，默认读取 DINGTALK_WEBHOOK",
+        default=os.getenv("DINGTALK_WEBHOOK1", "").strip(),
+        help="钉钉 webhook，默认读取 DINGTALK_WEBHOOK1",
     )
     parser.add_argument(
         "--secret",
-        default=os.getenv("DINGTALK_SECRET2", "").strip(),
-        help="钉钉签名 secret，默认读取 DINGTALK_SECRET",
+        default=os.getenv("DINGTALK_SECRET1", "").strip(),
+        help="钉钉签名 secret，默认读取 DINGTALK_SECRET1",
     )
     parser.add_argument(
         "--horizons",
@@ -79,4 +82,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
