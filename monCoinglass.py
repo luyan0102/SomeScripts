@@ -9,11 +9,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from env_loader import load_local_env
-
-
-load_local_env()
-
 # =========================
 # 配置
 # =========================

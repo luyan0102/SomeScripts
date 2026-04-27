@@ -2,11 +2,7 @@ import argparse
 import os
 from types import SimpleNamespace
 
-from env_loader import load_local_env
 import turning_point_btc as base
-
-
-load_local_env()
 
 DEFAULT_HORIZONS = [1, 6, 18]
 

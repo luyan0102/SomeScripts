@@ -20,11 +20,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import feedparser
 
-from env_loader import load_local_env
-
-
-load_local_env()
-
 # =========================
 # RSS 新闻源配置
 # =========================
