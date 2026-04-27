@@ -143,6 +143,51 @@ def price():
     return float(data["price"])
 
 
+def klines(interval="5m", limit=20):
+    data = fetch_json(
+        MARKET_BASE_URL,
+        "/fapi/v1/klines",
+        params={
+            "symbol": COINGLASS_PAIR_SYMBOL,
+            "interval": interval,
+            "limit": limit,
+        },
+    )
+    return [
+        {
+            "open": float(x[1]),
+            "high": float(x[2]),
+            "low": float(x[3]),
+            "close": float(x[4]),
+        }
+        for x in data
+    ]
+
+
+def price_metrics():
+    k5 = klines("5m", 4)
+    k15 = klines("15m", 4)
+
+    last5 = k5[-1]["close"]
+    prev5 = k5[-2]["close"]
+
+    last15 = k15[-1]["close"]
+    prev15 = k15[-2]["close"]
+
+    return {
+        "chg_5m": (last5 - prev5) / prev5,
+        "chg_15m": (last15 - prev15) / prev15,
+        "high_15m": max(x["high"] for x in k15),
+        "low_15m": min(x["low"] for x in k15),
+    }
+
+
+def zone_distance(px, pm):
+    upper_dist = (pm["high_15m"] - px) / px
+    lower_dist = (px - pm["low_15m"]) / px
+    return upper_dist, lower_dist
+
+
 def funding():
     now = time.time()
     if now - funding_cache["ts"] < 300:
@@ -289,7 +334,7 @@ def signal_commentary(signal, metrics):
     return "爆仓强度不足，维持观察。"
 
 
-def analyze(fund, oi_data, liq_data):
+def analyze(fund, oi_data, liq_data, pm, upper_dist, lower_dist):
     total_1h = liq_data["total_1h"]
     total_4h = liq_data["total_4h"]
     total_24h = liq_data["total_24h"]
@@ -312,18 +357,22 @@ def analyze(fund, oi_data, liq_data):
     oi_is_expanding = oi_change_15m >= MIN_OI_CHANGE_PCT_15M
     oi_is_shrinking = oi_change_15m <= -MIN_OI_REVERSAL_DROP_PCT_15M
 
-    if has_event and combined_bias > 0 and oi_is_expanding:
+    if has_event and combined_bias > 0 and oi_is_expanding and pm["chg_5m"] > 0:
         signal = "LONG"
         signal_mode = "MOMENTUM"
-    elif has_event and combined_bias < 0 and oi_is_expanding:
+
+    elif has_event and combined_bias < 0 and oi_is_expanding and pm["chg_5m"] < 0:
         signal = "SHORT"
         signal_mode = "MOMENTUM"
-    elif has_event and combined_bias > 0 and oi_is_shrinking:
+
+    elif has_event and combined_bias > 0 and oi_is_shrinking and pm["chg_5m"] < 0:
         signal = "SHORT"
         signal_mode = "REVERSAL"
-    elif has_event and combined_bias < 0 and oi_is_shrinking:
+
+    elif has_event and combined_bias < 0 and oi_is_shrinking and pm["chg_5m"] > 0:
         signal = "LONG"
         signal_mode = "REVERSAL"
+
     else:
         signal = "WAIT"
         signal_mode = "-"
@@ -350,6 +399,12 @@ def analyze(fund, oi_data, liq_data):
     else:
         oi_factor = 0.0
 
+    if signal == "LONG" and upper_dist < 0.003:
+        confidence += 0.05
+
+    if signal == "SHORT" and lower_dist < 0.003:
+        confidence += 0.05
+
     confidence = (
         0.55 * clamp(abs(combined_bias), 0.0, 1.0)
         + 0.25 * clamp(liq_accel / max(MIN_LIQUIDATION_ACCEL, 1e-6) - 1, 0.0, 1.0)
@@ -363,6 +418,10 @@ def analyze(fund, oi_data, liq_data):
     confidence = clamp(confidence, 0.0, 0.99)
 
     metrics = {
+        "price_change_5m": pm["chg_5m"],
+        "price_change_15m": pm["chg_15m"],
+        "upper_dist": upper_dist,
+        "lower_dist": lower_dist,
         "bias_1h": bias_1h,
         "bias_4h": bias_4h,
         "combined_bias": combined_bias,
@@ -431,6 +490,10 @@ def format_monitor_message(px, fund, oi_data, liq_data, sig, conf, metrics):
 交易对: {COINGLASS_PAIR_SYMBOL}
 
 价格: {px:.2f}
+5m涨跌: {metrics['price_change_5m']*100:.2f}%
+15m涨跌: {metrics['price_change_15m']*100:.2f}%
+上方扫空区距离: {metrics['upper_dist']*100:.2f}%
+下方扫多区距离: {metrics['lower_dist']*100:.2f}%
 Funding: {fund:.6f}
 OI: {oi_data['open_interest_quantity']:.2f}
 OI(USD): {oi_data['open_interest_usd']:,.2f}
@@ -464,6 +527,10 @@ def format_signal_message(px, fund, oi_data, liq_data, sig, conf, metrics, plan)
 交易对: {COINGLASS_PAIR_SYMBOL}
 
 价格: {px:.2f}
+5m涨跌: {metrics['price_change_5m']*100:.2f}%
+15m涨跌: {metrics['price_change_15m']*100:.2f}%
+上方扫空区距离: {metrics['upper_dist']*100:.2f}%
+下方扫多区距离: {metrics['lower_dist']*100:.2f}%
 Funding: {fund:.6f}
 OI: {oi_data['open_interest_quantity']:.2f}
 OI变化: 15m {oi_data['oi_change_15m']:.2f}% / 1h {oi_data['oi_change_1h']:.2f}%
@@ -501,11 +568,20 @@ def run():
     while True:
         try:
             px = price()
+            pm = price_metrics()
+            upper_dist, lower_dist = zone_distance(px, pm)
             fund = funding()
             oi_data = oi_snapshot()
             liq_data = liquidation_snapshot()
 
-            sig, signal_mode, conf, metrics = analyze(fund, oi_data, liq_data)
+            sig, signal_mode, conf, metrics = analyze(
+                fund,
+                oi_data,
+                liq_data,
+                pm,
+                upper_dist,
+                lower_dist,
+            )
             plan = build_trade_plan(px, sig, conf) if sig in {"LONG", "SHORT"} else None
 
             monitor_msg = format_monitor_message(

@@ -1,2 +1,4 @@
 requests>=2.31,<3
-snscrape>=0.7.0.20230622
+feedparser>=6.0.10
+numpy>=1.24.0
+pandas>=2.0.0

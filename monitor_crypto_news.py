@@ -179,7 +179,7 @@ def fetch_news() -> Optional[List[Dict]]:
     for source_key in sources:
         print(f"尝试从 {RSS_FEEDS[source_key]['name']} 获取...")
         try:
-            news = fetch_rss_feed(source_key, limit=20)
+            news = fetch_rss_feed(source_key, limit=MAX_NEWS_PER_POLL)
             if news:
                 print(f"{RSS_FEEDS[source_key]['name']} 获取成功，共 {len(news)} 条")
                 return news
@@ -380,7 +380,8 @@ def run_once(args) -> int:
             send_dingtalk(msg)
     
     if filtered:
-        latest = filtered[-1]
+        # RSS 通常"最新在前"，用第一条（最新）更新状态，避免重复推送
+        latest = filtered[0]
         state["last_timestamp"] = int(latest.get("pubtime", 0))
         state["last_news_id"] = latest.get("id")
         state["last_check"] = int(time.time())
@@ -419,8 +420,8 @@ def parse_args():
     parser.add_argument(
         "--limit",
         type=int,
-        default=20,
-        help="每次获取新闻数量"
+        default=MAX_NEWS_PER_POLL,
+        help="每次通知新闻数量上限（默认同 MAX_NEWS_PER_POLL）"
     )
     parser.add_argument(
         "--once",
