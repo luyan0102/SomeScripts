@@ -8,22 +8,22 @@
 echo 'export ENABLE_ALERTS=1' >> ~/.bashrc
 
 # 钉钉机器人 1 - BTC 拐点信号 (4h/1h)
-echo 'export DINGTALK_WEBHOOK1="https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_1"' >> ~/.bashrc
-echo 'export DINGTALK_SECRET1="SEC_YOUR_SECRET_1"' >> ~/.bashrc
+echo 'export DINGTALK_WEBHOOK1="https://oapi.dingtalk.com/robot/send?access_token=d4764056baa8a34085ed2d6ee5c5583fc0b269aad7afaccc01829c293f7a22d1"' >> ~/.bashrc
+echo 'export DINGTALK_SECRET1="SEC5f82cb8692508d03d40004ef4fec7d25b059177e0fa7c938971d93d2c073897d"' >> ~/.bashrc
 
 # 钉钉机器人 2 - CoinGlass 监控
-echo 'export DINGTALK_WEBHOOK2="https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_2"' >> ~/.bashrc
-echo 'export DINGTALK_SECRET2="SEC_YOUR_SECRET_2"' >> ~/.bashrc
+echo 'export DINGTALK_WEBHOOK2="https://oapi.dingtalk.com/robot/send?access_token=7e24c19e767c186e705ab86e49d894c1ed0e96029f10638c88b56dc3d7240b78"' >> ~/.bashrc
+echo 'export DINGTALK_SECRET2="SECbced08ea038edca33ebd29c5c8534bb8c2ad27ecb3d3a1b72719843385cc6e61"' >> ~/.bashrc
 
 # 钉钉机器人 3 - 加密货币新闻
-echo 'export DINGTALK_WEBHOOK3="https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_3"' >> ~/.bashrc
-echo 'export DINGTALK_SECRET3="SEC_YOUR_SECRET_3"' >> ~/.bashrc
+echo 'export DINGTALK_WEBHOOK3="https://oapi.dingtalk.com/robot/send?access_token=0e827683a6f8560cd5e672c2a1d01b4b03a5050cf1db105764a5ceafc874ccbd"' >> ~/.bashrc
+echo 'export DINGTALK_SECRET3="SECe02cc1b5eec9465cee8185d05dfeabd51c58976b1b00bad271cdf45db82f557b"' >> ~/.bashrc
 
 
 # =========================
 # CoinGlass 监控配置 (monCoinglass.py)
 # =========================
-echo 'export COINGLASS_API_KEY="your_coinglass_api_key"' >> ~/.bashrc
+echo 'export COINGLASS_API_KEY="6ade7ad07a4740ae8a76fdc4dd559550"' >> ~/.bashrc
 echo 'export COINGLASS_BASE_URL="https://open-api-v4.coinglass.com"' >> ~/.bashrc
 echo 'export COINGLASS_COIN_SYMBOL="BTC"' >> ~/.bashrc
 echo 'export COINGLASS_EXCHANGE="Binance"' >> ~/.bashrc
