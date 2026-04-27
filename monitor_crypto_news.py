@@ -55,9 +55,33 @@ _get_env()
 ALERT_COOLDOWN_SECONDS = int(os.getenv("NEWS_ALERT_COOLDOWN", "60"))
 MAX_NEWS_PER_POLL = int(os.getenv("MAX_NEWS_PER_POLL", "10"))
 
-DEFAULT_KEYWORDS = ["BTC", "Bitcoin", "ETH", "Ethereum", "Fed", "SEC", "利率"]
+DEFAULT_KEYWORDS = [
+    # 加密货币
+    "BTC", "Bitcoin", "ETH", "Ethereum", "crypto", "cryptocurrency",
+    "blockchain", "halving", "ETF", "stablecoin", "DeFi", "Layer",
+    "mining", "exchange", "altcoin", "bull", "bear", "liquidation",
+    "Solana", "SEC", "CFTC",
+    # 美联储与货币政策
+    "Fed", "FOMC", "Federal Reserve", "Powell", "interest rate",
+    "rate cut", "rate hike", "quantitative easing", "QE", "QT",
+    "tightening", "dovish", "hawkish",
+    # 通胀与物价
+    "inflation", "CPI", "PPI", "PCE", "core inflation", "deflation",
+    # 就业数据
+    "unemployment", "jobs", "payroll", "NFP", "nonfarm", "labor market",
+    # 经济增长
+    "GDP", "recession", "economic growth", "slowdown", "soft landing",
+    "hard landing", "stimulus",
+    # 财政与债务
+    "treasury", "yield", "bond", "debt", "deficit", "fiscal",
+    # 其他宏观
+    "retail sales", "consumer confidence", "PMI", "ISM", "housing starts",
+    "trade war", "tariff", "sanctions", "geopolitical"
+]
 KEYWORDS_ENV = os.getenv("NEWS_KEYWORDS", "")
-MONITOR_KEYWORDS = [k.strip() for k in KEYWORDS_ENV.split(",") if k.strip()] or DEFAULT_KEYWORDS
+env_keywords = [k.strip() for k in KEYWORDS_ENV.split(",") if k.strip()]
+# 合并环境变量和默认关键词（去重）
+MONITOR_KEYWORDS = list(dict.fromkeys(env_keywords + DEFAULT_KEYWORDS))
 
 EXCLUDE_KEYWORDS_ENV = os.getenv("NEWS_EXCLUDE_KEYWORDS", "")
 EXCLUDE_KEYWORDS = [k.strip() for k in EXCLUDE_KEYWORDS_ENV.split(",") if k.strip()]
@@ -167,7 +191,7 @@ def fetch_news() -> Optional[List[Dict]]:
 
 def filter_news(news_list: List[Dict]) -> List[Dict]:
     """
-    根据关键词过滤新闻
+    根据关键词过滤新闻（模糊匹配）
     """
     filtered = []
     
@@ -203,8 +227,22 @@ def filter_news(news_list: List[Dict]) -> List[Dict]:
         
         matched_keywords = []
         for keyword in MONITOR_KEYWORDS:
-            if keyword.lower() in text:
-                matched_keywords.append(keyword)
+            keyword_lower = keyword.lower()
+            # 精确匹配
+            if keyword_lower in text:
+                # 短关键词（<=3 字符）必须是独立单词
+                if len(keyword_lower) <= 3:
+                    import re
+                    if re.search(rf'\b{re.escape(keyword_lower)}\b', text):
+                        matched_keywords.append(keyword)
+                else:
+                    matched_keywords.append(keyword)
+            # 长关键词模糊匹配（单词的一部分）
+            elif len(keyword_lower) >= 4:
+                for word in text.split():
+                    if keyword_lower in word:
+                        matched_keywords.append(keyword)
+                        break
         
         if matched_keywords:
             news["_matched_keywords"] = matched_keywords
